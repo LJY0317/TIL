@@ -1,4 +1,4 @@
-CLI (Command Line Interface)란?
+# CLI (Command Line Interface)란?
   명령어를 통해 사용자와 컴퓨터가 사용하는 방식
 
 CLI에서 '.'(점)의 역할
