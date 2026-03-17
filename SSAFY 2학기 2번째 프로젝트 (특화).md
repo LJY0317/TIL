@@ -182,3 +182,51 @@ Gazebo와 ROS 2는 별개의 통신 체계를 사용하기 때문에 **브릿지
 - `i`=전진, `j`=좌회전, `l`=우회전, `k`=**정지**
 - `q`/`z`=속도 증가/감소
 - 반드시 **Gazebo Play 버튼(▶)**을 눌러야 물리 시뮬레이션이 시작된다.
+
+
+# 26. 03. 17.
+## S14P-101 센서 출력 점검과 브리지 구조 정리
+오늘은 프로젝트 계획서에 적혀 있던 `S14P-101 센서 출력 점검`을 실제로 수행했다. 목표는 "토픽 이름이 보인다" 수준이 아니라, 카메라, LiDAR, IMU, `/odom`이 실제 메시지를 내보내는지 확인하고, 팀원들이 같은 브랜치를 pull 받아도 같은 결과를 재현할 수 있게 런치와 문서를 정리하는 것이었다.
+
+### 1. Gazebo가 pause 상태로 시작하면 센서가 안 나간다
+- 처음에는 `ros2 topic list`로 보면 `/agribot/camera/image`, `/agribot/imu`, `/odom` 같은 토픽 이름이 모두 보여서 정상처럼 보였다.
+- 하지만 `ros2 topic echo --once`나 `ros2 topic hz`로 확인하면 메시지가 들어오지 않았다.
+- 원인을 추적해보니 Gazebo가 기본적으로 **정지(pause)** 상태로 시작하고 있었고, 이 경우 센서 토픽 객체는 생성되어도 실제 데이터 스트림은 흐르지 않았다.
+- 해결 방법은 `spawn_agribot.launch.py`에서 Gazebo 실행 인자에 `-r`을 넣어 **시작 즉시 재생(run)** 상태로 띄우는 것이었다.
+- 예전에는 GUI에서 직접 Play 버튼을 눌러야 했다면, 이제는 launch만 실행해도 바로 센서가 발행된다.
+
+### 2. 카메라 토픽은 단일 parameter_bridge보다 전용 브리지가 더 안정적이다
+- 처음에는 카메라 image, depth, camera_info, LiDAR, IMU, odom을 전부 하나의 `ros_gz_bridge parameter_bridge`에 묶어 두었다.
+- 그런데 이 구성에서는 `/agribot/camera/image`, `/agribot/camera/depth_image`, `/agribot/camera/camera_info`가 Gazebo 쪽에서는 보이는데 ROS 쪽에서는 `echo --once`가 계속 timeout 나는 현상이 있었다.
+- 토픽을 하나씩 분리해서 검증해보니:
+  - `/agribot/camera/image`는 `ros_gz_image image_bridge`를 쓰면 정상 수신
+  - `/agribot/camera/depth_image`도 `ros_gz_image image_bridge`를 쓰면 정상 수신
+  - `/agribot/camera/camera_info`는 별도 `parameter_bridge`로 분리하면 정상 수신
+- 결론적으로 **대용량 이미지 계열은 `ros_gz_image`, 메타데이터는 별도 `parameter_bridge`**로 나누는 것이 더 안정적이었다.
+- 그래서 메인 launch도 이 구조를 그대로 반영했다.
+
+### 3. IMU와 Odometry는 정상, LiDAR는 아직 미해결
+- 최종적으로 확인된 토픽 상태는 아래와 같다.
+  - 정상 수신: `/agribot/camera/image`, `/agribot/camera/depth_image`, `/agribot/camera/camera_info`, `/agribot/imu`, `/odom`, `/clock`
+  - 미수신: `/agribot/lidar/scan`
+- IMU는 Gazebo 헤더 기준으로 `0.890s -> 0.900s -> 0.910s`처럼 증가해서 **100Hz 설정이 정상 반영**되고 있음을 확인했다.
+- Odometry도 `0.884s -> 0.918s -> 0.952s`로 증가하여 **약 30Hz 수준**으로 확인됐다.
+- 반면 LiDAR는 메인 launch뿐 아니라 **별도 브리지로 단독 연결해도 ROS/GZ 양쪽에서 메시지 수신이 실패**했다.
+- 즉, LiDAR 문제는 단순 bridge 오타보다는 `gpu_lidar` 센서 자체, 렌더링 계층, 또는 시뮬레이터 성능 문제 쪽을 먼저 의심해야 한다는 결론을 얻었다.
+
+### 4. 시뮬레이션 내부 시간과 실제 벽시계 시간은 다를 수 있다
+- IMU는 Gazebo 내부 타임스탬프 기준으로 100Hz였지만, `ros2 topic hz /agribot/imu`를 실제 벽시계 기준으로 재보면 약 `0.635Hz`밖에 나오지 않았다.
+- 이 차이는 센서 설정값이 잘못된 것이 아니라, **Gazebo가 너무 느리게 돌고 있어서 real-time factor가 크게 떨어졌기 때문**이다.
+- 즉, 시뮬레이션에서는 "토픽이 설정된 주기로 생성되더라도" 컴퓨터 입장에서는 그것이 아주 천천히 전달될 수 있다.
+- 센서 점검을 할 때는 **시뮬레이션 시간 기준 정상 여부**와 **실제 실행 성능 문제**를 분리해서 봐야 한다는 걸 배웠다.
+
+### 5. 성능 저하의 큰 원인은 trimesh collision일 가능성이 높다
+- Gazebo 실행 중 `ODE Message 2: Trimesh-trimesh contact hash table bucket overflow` 경고가 반복적으로 출력되었다.
+- 코드를 확인해보니 `greenhouse`, `tomato_plant`, `tomato` 모델이 모두 GLB/OBJ 메시를 **visual뿐 아니라 collision에도 그대로 사용**하고 있었다.
+- 이 방식은 보기에는 편하지만, 물리 엔진이 삼각형 메시 간 충돌을 전부 계산해야 해서 성능이 급격히 떨어진다.
+- 앞으로는 시각화용 외형은 메시를 유지하되, collision은 box / cylinder / sphere 같은 **단순 충돌체**로 바꿔야 한다.
+
+### 6. 문서화의 중요성
+- 이번 작업은 단순 코드 수정으로 끝내지 않고, `S14P-101_센서_출력_점검.md`에 점검 환경, 실행 명령, 센서 점검표, bridge 수정 포인트, 남은 이슈까지 정리했다.
+- 협업에서는 "내 컴퓨터에서는 됨"이 아니라, **누가 pull 받아도 같은 명령으로 같은 결과가 나와야 한다**는 점이 핵심이라는 걸 다시 느꼈다.
+- 특히 이번처럼 센서 출력 점검은 다음 작업(`S14P-102` 프레임 정합, `S14P-103` 주행 보정)의 출발점이 되므로, 로그와 판단 근거를 남겨 두는 것이 중요하다.
