@@ -1902,3 +1902,6 @@ sed -n '1,120p' ~/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/config/patr
 - agribot_ws/src/agribot_navigation/setup.py
 - agribot_ws/src/agribot_navigation/package.xml
 - agribot_ws/src/agribot_navigation/test/test_harvest_routing.py
+
+
+[S14P-94] 
