@@ -95,3 +95,94 @@ GUI 없이 빠르게 확인:
 ```bash
 ros2 launch agribot_navigation autonomous_mapping.launch.py use_rviz:=false
 ```
+
+### 추가 진행한 작업
+
+- 자율 매핑 기본 동작을 greenhouse 전용 waypoint patrol에서 일반 frontier exploration으로 바꿨다.
+- 원인을 LiDAR 범위 부족 하나로 단정하지 않고, 탐색 방식, Nav2 controller, costmap, SLAM, AMCL, 센서 유효 범위를 함께 조정했다.
+- 그래서 이제 기본 `autonomous_mapping.launch.py`는 다른 맵으로 바꿔도 frontier 기반으로 자율 탐색/매핑을 시도할 수 있다.
+
+### 이번에 추가로 수정한 파일
+
+- `/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/agribot_navigation/frontier_explorer.py`
+- `/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/config/frontier_explorer.yaml`
+- `/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/test/test_frontier_explorer.py`
+- `/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/launch/autonomous_mapping.launch.py`
+- `/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/config/nav2_mapping_params.yaml`
+- `/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/config/slam_mapping.yaml`
+- `/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/config/amcl.yaml`
+- `/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_description/models/agribot/model.sdf`
+
+### 추가 핵심 변경 내용
+
+- 기본 자율 매핑 launch
+  - `use_frontier_explorer:=true`
+  - `use_patrol:=false`
+  - `use_boundary_map:=false`
+- 새 frontier explorer
+  - live `/map` 기준 frontier cluster 탐색
+  - 실패 goal blacklist 후 재시도
+  - 상태 topic: `/mapping_explorer/status`
+  - 서비스: `/mapping_explorer/start`, `/mapping_explorer/stop`, `/mapping_explorer/resume`
+- 센서/맵 관련 값
+  - LiDAR samples `360 -> 720`
+  - LiDAR max range `10.0 -> 25.0`
+  - RGB-D far clip `10.0 -> 25.0`
+  - SLAM / AMCL laser range도 `25.0` 기준으로 조정
+- mapping 모드 Nav2
+  - `use_rotate_to_heading: false`
+  - lookahead / tolerance / local/global costmap 범위 재조정
+  - 막힌 frontier에서 즉시 끝나지 않고 다른 frontier로 계속 진행
+
+### 추가 검증 내용
+
+- `python3 -m pytest src/agribot_navigation/test/test_harvest_routing.py src/agribot_navigation/test/test_frontier_explorer.py`
+  - `6 passed`
+- `colcon build --packages-select agribot_navigation agribot_description agribot_bringup --symlink-install`
+  - 통과
+- 실제 런타임 검증
+  - `ros2 launch agribot_navigation autonomous_mapping.launch.py use_rviz:=false`
+  - frontier goal 생성 확인
+  - `/mapping_explorer/status`가 `exploring`으로 유지되는 것 확인
+  - 최대 선속도 약 `1.5155 m/s`
+  - planner에서 `Start occupied`가 떠도 blacklist 후 다음 frontier로 재시도하는 것 확인
+
+### 추가 커밋
+
+- 커밋 해시: `7185809`
+- 메시지: `Add frontier-based autonomous mapping explorer`
+
+### 지금 기준으로 다시 빌드 / 실행할 때 명령어
+
+```bash
+cd /home/ssafy/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select agribot_navigation agribot_description agribot_bringup --symlink-install
+source install/setup.bash
+```
+
+기본 frontier 기반 자율 매핑:
+
+```bash
+ros2 launch agribot_navigation autonomous_mapping.launch.py use_rviz:=false
+```
+
+frontier explorer 수동 제어:
+
+```bash
+ros2 service call /mapping_explorer/start std_srvs/srv/Trigger "{}"
+ros2 service call /mapping_explorer/stop std_srvs/srv/Trigger "{}"
+ros2 service call /mapping_explorer/resume std_srvs/srv/Trigger "{}"
+ros2 topic echo /mapping_explorer/status
+```
+
+기존 greenhouse patrol 방식으로 다시 실행하고 싶다면:
+
+```bash
+ros2 launch agribot_navigation autonomous_mapping.launch.py \
+  use_patrol:=true \
+  patrol_autostart:=true \
+  use_frontier_explorer:=false \
+  use_boundary_map:=true \
+  use_rviz:=false
+```

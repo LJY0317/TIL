@@ -1904,4 +1904,237 @@ sed -n '1,120p' ~/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/config/patr
 - agribot_ws/src/agribot_navigation/test/test_harvest_routing.py
 
 
-[S14P-94] 
+[S14P-94] 일반 환경에서도 멈추지 않는 frontier 기반 자율 매핑으로 전환
+
+## 배경
+
+- 기존 `autonomous_mapping.launch.py`는 이름과 달리 사실상 greenhouse 전용 waypoint patrol 기반 동작이었습니다.
+- 그래서 로봇이 맵 전체를 일반적으로 탐색하는 것이 아니라, 짧은 구간 waypoint를 따라가며 자주 heading을 맞추고, 실패 시 그대로 멈추는 흐름에 가까웠습니다.
+- 사용자가 체감한 "조금씩 움직이고, 좌우를 자주 보느라 전진을 거의 못 하는" 현상은 LiDAR 좌우 시야각 부족이 주원인이라기보다, 아래 요인이 겹친 결과로 보는 것이 맞았습니다.
+  - greenhouse 전용 patrol 중심 매핑 구조
+  - mapping 모드 Nav2 controller의 보수적 회전/접근 설정
+  - 실패 goal 재시도 정책 부재
+  - 고속 주행 대비 부족했던 센서 사거리와 live map 활용 폭
+
+즉, 이번 MR은 "센서 범위를 무작정 8배"로 키우는 식이 아니라, 탐색기 구조, Nav2, SLAM, 센서 유효 범위를 함께 수정해서 일반 환경에서도 완주 가능성을 높이는 방향으로 정리했습니다.
+
+---
+
+## 핵심 변경
+
+### 1. greenhouse patrol 중심 매핑에서 frontier 기반 일반 탐색으로 전환
+
+- `agribot_navigation.frontier_explorer` 노드를 새로 추가했습니다.
+- 이 노드는 live `/map`에서 frontier cluster를 찾아 `NavigateToPose` goal을 직접 생성합니다.
+- 가장 가까운 점만 고르는 대신, cluster 크기와 거리 점수를 함께 써서 "한 번에 더 멀리, 더 넓게" 탐색하도록 했습니다.
+- 한 번 실패한 frontier goal은 blacklist에 넣고 다음 후보로 넘어가게 해서, 특정 지점에서 `planner failed`가 나와도 매핑이 그대로 중단되지 않도록 했습니다.
+- 상태와 제어 인터페이스도 같이 추가했습니다.
+  - `/mapping_explorer/status`
+  - `/mapping_explorer/start`
+  - `/mapping_explorer/stop`
+  - `/mapping_explorer/resume`
+
+### 2. `autonomous_mapping.launch.py` 기본 동작을 일반 환경 기준으로 재구성
+
+- 기본값을 아래처럼 바꿨습니다.
+  - `use_frontier_explorer:=true`
+  - `use_patrol:=false`
+  - `use_boundary_map:=false`
+- 즉 이제 기본 자율 매핑은 greenhouse 경계맵에 묶이지 않고, frontier explorer가 live SLAM map을 기준으로 움직입니다.
+- 기존 greenhouse 전용 patrol 방식은 완전히 제거하지 않고 옵션으로 남겼습니다.
+- 따라서 앞으로 지도를 다른 맵으로 바꿔도, 기본 launch만으로 frontier 기반 자율 매핑을 바로 시도할 수 있습니다.
+
+### 3. mapping 모드 Nav2를 "자주 멈추고 제자리에서 각도 맞추는" 성향에서 벗어나도록 재튜닝
+
+- `bt_navigator`, `planner_server`, `behavior_server`의 global frame을 `map`으로 정리했습니다.
+- `FollowPath`는 아래처럼 더 길게 보고 직선으로 밀 수 있게 바꿨습니다.
+  - `desired_linear_vel: 1.60`
+  - `lookahead_dist: 1.40`
+  - `max_lookahead_dist: 3.50`
+  - `approach_velocity_scaling_dist: 2.50`
+  - `use_rotate_to_heading: false`
+  - `rotate_to_heading_min_angle: 1.20`
+- goal checker와 planner tolerance도 매핑용으로 완화했습니다.
+  - `xy_goal_tolerance: 0.50`
+  - `yaw_goal_tolerance: 0.75`
+  - `planner tolerance: 0.50`
+  - `allow_unknown: true`
+- local/global costmap obstacle range를 `25.0 / 20.0m`로 확장하고, local window를 `12x12m`로 늘려 더 먼 frontier까지 한 번에 보고 갈 수 있게 했습니다.
+
+### 4. 센서는 "8배 고정"이 아니라, 실제 시뮬레이션과 탐색 목적에 맞는 범위로 확장
+
+- LiDAR는 원래도 360도 회전 스캔이었기 때문에 "좌우 범위가 좁아서 좌우를 자주 본다"는 해석은 맞지 않았습니다.
+- 대신 고속 주행과 넓은 frontier 탐색을 위해 유효 거리와 해상도를 현실적인 수준으로 올렸습니다.
+  - LiDAR horizontal samples: `360 -> 720`
+  - LiDAR max range: `10.0m -> 25.0m`
+  - RGB-D far clip: `10.0m -> 25.0m`
+  - SLAM `max_laser_range: 25.0`
+  - AMCL `laser_max_range: 25.0`
+- 8배를 그대로 적용해 `80m`급으로 키우지 않은 이유는 명확합니다.
+  - greenhouse / 실내 모바일 로봇 / 로보락 급 플랫폼 대비 비현실적으로 큼
+  - Gazebo ray 계산 비용만 키우고 실시간율을 악화시킬 수 있음
+  - 일반 환경에서 필요한 건 "무한정 긴 센서"보다 "탐색 정책 + costmap + retry" 정합성임
+
+### 5. SLAM / localization도 고속 탐색에 맞게 같이 조정
+
+- `slam_mapping.yaml`
+  - `max_laser_range: 25.0`
+  - `minimum_travel_distance: 0.05`
+  - `scan_buffer_size: 60`
+  - `scan_buffer_maximum_scan_distance: 25.0`
+- `amcl.yaml`
+  - `laser_max_range: 25.0`
+  - `laser_likelihood_max_dist: 4.0`
+  - `max_beams: 120`
+
+이렇게 해야 속도만 올리고 센서/맵 갱신이 못 따라오는 현상을 줄일 수 있습니다.
+
+---
+
+## 구현 상세
+
+### 새 노드
+
+- `agribot_ws/src/agribot_navigation/agribot_navigation/frontier_explorer.py`
+- `agribot_ws/src/agribot_navigation/config/frontier_explorer.yaml`
+
+### 주요 설계 포인트
+
+- frontier cluster를 찾을 때 단일 점이 아니라 cluster 단위로 처리
+- candidate score에 거리와 cluster 크기를 모두 반영
+- 실패 goal blacklist
+- map 업데이트가 더 들어올 때까지 여러 번 확인한 뒤에만 `completed` 처리
+- boundary map은 옵션으로 유지
+- default frame은 `map`
+
+### 추가 테스트
+
+- `agribot_ws/src/agribot_navigation/test/test_frontier_explorer.py`
+- 검증 항목
+  - frontier cluster 검출
+  - 더 크고 더 먼 cluster 우선 선택
+  - blacklist goal 제외
+
+---
+
+## 검증
+
+### 정적 검증
+
+아래 항목을 직접 수행했습니다.
+
+```bash
+cd ~/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+
+python3 -m compileall src/agribot_navigation/agribot_navigation
+python3 -m py_compile src/agribot_navigation/launch/autonomous_mapping.launch.py
+
+colcon build --packages-select agribot_navigation agribot_description agribot_bringup --symlink-install
+source install/setup.bash
+
+python3 -m pytest \
+  src/agribot_navigation/test/test_harvest_routing.py \
+  src/agribot_navigation/test/test_frontier_explorer.py
+```
+
+결과:
+
+- `compileall` 통과
+- launch python 문법 검사 통과
+- 빌드 통과
+- `pytest` 기준 `6 passed`
+
+### 런타임 검증
+
+아래 명령으로 실제 자율 매핑 런을 확인했습니다.
+
+```bash
+cd ~/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+ros2 launch agribot_navigation autonomous_mapping.launch.py use_rviz:=false
+```
+
+확인 내용:
+
+- frontier explorer가 실제로 frontier goal을 생성함
+  - `Navigating to frontier goal (1.55, 1.95) size=1156 score=146.99`
+  - `Navigating to frontier goal (10.51, 24.14) size=14690 score=1844.25`
+- `/mapping_explorer/status` 기준 state가 `exploring`으로 유지되며 active goal이 갱신됨
+- `/odom` 기준 최대 선속도 약 `1.5155 m/s`
+- `/odom` 기준 최대 각속도 약 `1.5245 rad/s`
+- planner에서 일시적으로 `Start occupied`가 나오는 경우가 있었지만, explorer가 해당 goal을 blacklist 처리하고 다음 frontier로 넘어가면서 매핑이 이어짐
+
+즉, 이번 MR의 핵심은 "실패 한 번에 중단"이 아니라 "실패해도 다음 frontier로 계속 진행"하도록 바꾼 점입니다.
+
+---
+
+## 기대 효과
+
+- greenhouse 외의 다른 맵으로 바꿔도 기본 launch만으로 frontier 기반 자율 매핑을 시도할 수 있습니다.
+- 짧은 waypoint 단위로 찔끔찔끔 움직이는 대신, 더 큰 frontier 목표를 향해 길게 직진하는 비중이 커집니다.
+- 특정 frontier가 막혀도 바로 자율주행이 중단되지 않고, 다른 후보를 골라 완주 가능성을 높입니다.
+- 센서 범위, costmap 범위, SLAM/AMCL 파라미터, 고속 controller 설정이 서로 같은 방향을 보게 됐습니다.
+
+---
+
+## 남아 있는 한계
+
+- "모든 환경에서 반드시 100% 완주"를 정적으로 보장할 수는 없습니다.
+- 극단적으로 좁은 통로, moving obstacle, 큰 미지 공간의 초기 pose 불안정성은 여전히 별도 튜닝이 필요할 수 있습니다.
+- 현재 Gazebo에서는 GPU LiDAR 성능과 실시간율 영향이 있어, 설정상 `20 Hz`여도 실측 rate는 더 낮게 나올 수 있습니다.
+
+그래도 이전처럼 greenhouse 고정 patrol 구조에 묶인 상태보다, 일반 환경 대응성과 재시도 내구성은 분명히 좋아졌습니다.
+
+---
+
+## 실행 명령
+
+기본 frontier 기반 자율 매핑:
+
+```bash
+cd ~/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 launch agribot_navigation autonomous_mapping.launch.py use_rviz:=false
+```
+
+old greenhouse patrol 방식으로 실행:
+
+```bash
+ros2 launch agribot_navigation autonomous_mapping.launch.py \
+  use_patrol:=true \
+  patrol_autostart:=true \
+  use_frontier_explorer:=false \
+  use_boundary_map:=true \
+  use_rviz:=false
+```
+
+탐색기 수동 제어:
+
+```bash
+ros2 service call /mapping_explorer/start std_srvs/srv/Trigger "{}"
+ros2 service call /mapping_explorer/stop std_srvs/srv/Trigger "{}"
+ros2 service call /mapping_explorer/resume std_srvs/srv/Trigger "{}"
+ros2 topic echo /mapping_explorer/status
+```
+
+---
+
+## 커밋
+
+- `7185809` `Add frontier-based autonomous mapping explorer`
+
+## 변경 파일
+
+- agribot_ws/src/agribot_description/models/agribot/model.sdf
+- agribot_ws/src/agribot_navigation/config/amcl.yaml
+- agribot_ws/src/agribot_navigation/config/nav2_mapping_params.yaml
+- agribot_ws/src/agribot_navigation/config/slam_mapping.yaml
+- agribot_ws/src/agribot_navigation/launch/autonomous_mapping.launch.py
+- agribot_ws/src/agribot_navigation/setup.py
+- agribot_ws/src/agribot_navigation/agribot_navigation/frontier_explorer.py
+- agribot_ws/src/agribot_navigation/config/frontier_explorer.yaml
+- agribot_ws/src/agribot_navigation/test/test_frontier_explorer.py
