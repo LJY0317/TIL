@@ -2138,3 +2138,274 @@ ros2 topic echo /mapping_explorer/status
 - agribot_ws/src/agribot_navigation/agribot_navigation/frontier_explorer.py
 - agribot_ws/src/agribot_navigation/config/frontier_explorer.yaml
 - agribot_ws/src/agribot_navigation/test/test_frontier_explorer.py
+
+
+[S14P-94] 좁은 공간 끼임 대응을 Nav2 BackUp recovery 중심으로 일반화
+
+## 배경
+
+- 현재 agribot은 좁은 곳에 들어갔다가 앞쪽이 막히면, 제자리에서 조금씩 비비거나 heading만 바꾸다가 사실상 빠져나오지 못하는 현상이 있었습니다.
+- 이 문제를 특정 greenhouse 맵 전용 예외처리로 막는 대신, 다른 맵으로 바뀌어도 재사용 가능한 일반적인 Nav2 방식으로 정리하는 것이 목표였습니다.
+- 사용자가 제안한 "후진해서 빠져나오기"는 방향 자체는 맞습니다. 다만 구현 포인트는 `controller가 항상 후진 경로를 계획하도록 만들 것인지`, `stuck 상태를 감지했을 때 Nav2 recovery로 짧고 안전하게 후진시킬 것인지`를 구분해야 했습니다.
+
+이번 MR에서는 두 번째를 먼저 채택했습니다. 이유는 현재 스택이 `SmacPlanner2D + RegulatedPurePursuit + NavigateToPose` 기반이고, 이 구조에서 가장 안정적으로 일반화되는 방법이 "막힘 감지 후 recovery behavior로 BackUp 실행"이기 때문입니다.
+
+---
+
+## 조사 결과
+
+### 1. 현재 stack도 원리상 후진 recovery는 가능했지만, 발동이 너무 늦었다
+
+- Nav2 공식 기본 BT 설명에 따르면 기본 `navigate_to_pose_w_replanning_and_recovery.xml`의 system-level recovery는 아래 순서입니다.
+  - clear both costmaps
+  - `Spin`
+  - `Wait`
+  - `BackUp`
+- 즉 Nav2 자체에는 원래 `BackUp` recovery가 있습니다.
+- 문제는 현재 agribot 쪽 설정에서 이 recovery가 충분히 빨리/강하게 발동하지 않았다는 점입니다.
+  - mapping용 `SimpleProgressChecker`가 `required_movement_radius=0.30`, `movement_time_allowance=30.0`이라 막힌 상태에서도 오랫동안 recovery로 넘어가지 않았습니다.
+  - 기본 recovery 순서도 `Spin -> Wait -> BackUp`이라, 좁은 공간처럼 회전이 특히 불리한 상황에서는 탈출 성공률이 낮습니다.
+
+참고:
+
+- Nav2 Detailed Behavior Tree Walkthrough
+  - https://docs.nav2.org/behavior_trees/overview/detailed_behavior_tree_walkthrough.html
+- Nav2 SimpleProgressChecker
+  - https://docs.nav2.org/configuration/packages/nav2_controller-plugins/simple_progress_checker.html
+
+### 2. 로봇청소기류도 일반적으로 "로컬 recovery + 반복 구역 제외" 조합을 쓴다
+
+- iRobot 공식 문서도, 특정 구역에서 로봇이 반복적으로 끼는 경우 `Keep-Out Zone`을 추천합니다.
+- 즉 업계 관점에서도 보편적인 1차 해법은
+  - 로컬 recovery로 일단 스스로 빠져나오게 하고
+  - 반복적으로 문제를 일으키는 장소만 별도 exclusion / keep-out으로 관리하는 구조입니다.
+
+참고:
+
+- iRobot Keep-Out Zones
+  - https://homesupport.irobot.com/articles/en_US/Knowledge/21094
+
+이번 MR에서는 "일반 환경에 두루 쓰는 1차 해법"으로 recovery와 navigation tuning을 우선 적용했고, keep-out은 후속 선택지로 남겼습니다.
+
+---
+
+## 핵심 설계 판단
+
+### 왜 `allow_reversing=true`를 바로 켜지 않았나
+
+- `RegulatedPurePursuit`의 `allow_reversing`은 "경로 자체에 후진 segment가 있을 때 그것을 따라가게 하는 기능"에 가깝습니다.
+- 그런데 현재 planner는 `SmacPlanner2D`이고, 문제의 핵심도 "좁은 곳에서 경로 추종이 막혔을 때 탈출"입니다.
+- 이 상황에서는 planner/controller 전체를 reverse-capable stack으로 바꾸는 것보다, Nav2의 공식 recovery action인 `BackUp`을 먼저 활용하는 편이 더 안전하고 일반적입니다.
+- 즉 이번 변경은 "항상 후진 주행"이 아니라, "진행 불가를 감지했을 때 안전하게 후진해서 빠져나오기"에 초점을 맞췄습니다.
+
+### 왜 BT를 커스텀했나
+
+- Nav2 공식 문서도 BT XML을 애플리케이션별로 재구성할 수 있다고 안내합니다.
+- 현재 문제는 특정 알고리즘 미구현보다 "recovery 순서와 발동 기준"이 현 환경에 맞지 않은 쪽이 더 컸습니다.
+- 그래서 코어 알고리즘 자체를 새로 만들지 않고, Nav2가 이미 제공하는
+  - `BackUp`
+  - `Spin`
+  - `Wait`
+  - `ClearEntireCostmap`
+  를 조합하는 방식으로 해결했습니다.
+
+---
+
+## 변경 사항
+
+### 1. Nav2 recovery BT를 커스텀
+
+아래 BT 파일을 새로 추가했습니다.
+
+- `agribot_ws/src/agribot_navigation/behavior_trees/navigate_to_pose_w_backout_recovery.xml`
+- `agribot_ws/src/agribot_navigation/behavior_trees/navigate_through_poses_w_backout_recovery.xml`
+
+핵심 차이:
+
+- 기본 tree는 `clear -> spin -> wait -> back up`
+- 이번 tree는 `clear -> short back up -> long back up -> spin -> wait`
+
+즉 좁은 공간에서 가장 가능성이 높은 탈출 방법인 `BackUp`을 먼저 시도하게 바꿨습니다.
+
+구체적으로는:
+
+- 1차 후진: `0.40m` / `0.10m/s`
+- 2차 후진: `0.80m` / `0.08m/s`
+- 그 다음에야 `Spin`
+- 마지막으로 `Wait`
+
+이렇게 하면 "제자리에서 각도만 바꾸려다 계속 막히는" 상황보다, "일단 들어온 방향으로 짧게 후퇴해 회전 공간을 확보"하는 쪽으로 behavior가 바뀝니다.
+
+### 2. 두 launch 모두 새 BT를 기본 주입
+
+- `agribot_ws/src/agribot_navigation/launch/navigation.launch.py`
+- `agribot_ws/src/agribot_navigation/launch/autonomous_mapping.launch.py`
+
+위 두 launch에서 `bt_navigator`에 아래 절대 경로 파라미터를 넘기도록 변경했습니다.
+
+- `default_nav_to_pose_bt_xml`
+- `default_nav_through_poses_bt_xml`
+
+즉 일반 네비게이션과 autonomous mapping 모두 같은 tight-space recovery 정책을 사용합니다.
+
+### 3. stuck 판정을 더 빨리 하도록 progress checker 조정
+
+#### mapping 모드
+
+- `required_movement_radius: 0.30`
+- `movement_time_allowance: 30.0 -> 8.0`
+
+#### 일반 navigation 모드
+
+- `required_movement_radius: 0.20 -> 0.30`
+- `movement_time_allowance: 8.0` 유지
+
+Nav2 공식 `SimpleProgressChecker` 문서 기본값도 `0.5m / 10.0s` 수준입니다. 현재 로봇 크기와 속도를 고려하면, "8초 동안 30cm도 못 움직이면 막힌 것으로 본다"는 해석이 충분히 현실적입니다.
+
+### 4. 아예 너무 좁은 곳으로 파고들지 않도록 costmap/planner를 보수적으로 조정
+
+#### 공통
+
+- `footprint_padding: 0.02 -> 0.04`
+- `planner_server.GridBased.cost_travel_multiplier: 2.0 -> 3.0`
+
+#### 일반 navigation
+
+- local/global `inflation_radius: 0.45 -> 0.55`
+
+#### autonomous mapping
+
+- local/global `inflation_radius: 0.35 -> 0.55`
+
+이 조정의 의미:
+
+- footprint를 실제보다 약간 더 크게 보고
+- 장애물 주변 cost를 더 넓게 퍼뜨려
+- planner가 벽에 바짝 붙거나 애매하게 좁은 틈으로 파고드는 것을 줄입니다.
+
+즉 "끼었을 때 나오는 기능"만 넣은 것이 아니라, "애초에 그런 상황에 덜 들어가게"도 같이 바꿨습니다.
+
+### 5. 설치/패키징
+
+- `agribot_ws/src/agribot_navigation/setup.py`에 `behavior_trees/*.xml` 설치를 추가했습니다.
+
+---
+
+## 검증
+
+### 정적 검증
+
+아래를 직접 확인했습니다.
+
+```bash
+cd ~/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+
+python3 -m py_compile \
+  src/agribot_navigation/launch/navigation.launch.py \
+  src/agribot_navigation/launch/autonomous_mapping.launch.py
+
+xmllint --noout \
+  src/agribot_navigation/behavior_trees/navigate_to_pose_w_backout_recovery.xml \
+  src/agribot_navigation/behavior_trees/navigate_through_poses_w_backout_recovery.xml
+
+python3 -m pytest \
+  src/agribot_navigation/test/test_harvest_routing.py \
+  src/agribot_navigation/test/test_frontier_explorer.py
+
+colcon build --packages-select agribot_navigation agribot_bringup --symlink-install
+```
+
+결과:
+
+- launch python 문법 검사 통과
+- BT XML 문법 검사 통과
+- `pytest` 기준 `6 passed`
+- `agribot_navigation`, `agribot_bringup` 빌드 통과
+
+### 런타임 확인
+
+아래 명령으로 실제 stack을 띄운 뒤 파라미터를 확인했습니다.
+
+```bash
+cd ~/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+ros2 launch agribot_navigation autonomous_mapping.launch.py use_rviz:=false
+```
+
+별도 터미널에서 확인:
+
+```bash
+ros2 param get /bt_navigator default_nav_to_pose_bt_xml
+ros2 param get /controller_server progress_checker.required_movement_radius
+ros2 param get /controller_server progress_checker.movement_time_allowance
+```
+
+확인 결과:
+
+- `default_nav_to_pose_bt_xml`
+  - `/home/ssafy/SSAFY/S14P21A602/agribot_ws/install/agribot_navigation/share/agribot_navigation/behavior_trees/navigate_to_pose_w_backout_recovery.xml`
+- `progress_checker.required_movement_radius = 0.3`
+- `progress_checker.movement_time_allowance = 8.0`
+
+즉 새 recovery tree와 stuck 판정 기준이 실제 런타임에 반영되는 것까지 확인했습니다.
+
+---
+
+## 기대 효과
+
+- 로봇이 좁은 공간에서 막혔을 때, 예전처럼 한참 비비다가 멈추는 대신 더 빨리 recovery로 넘어갑니다.
+- recovery에 들어가면 `Spin`보다 `BackUp`이 먼저 실행돼, 들어온 방향으로 후퇴해 빠져나올 확률이 높아집니다.
+- planner/costmap이 더 보수적으로 좁은 틈을 평가하므로, 애초에 끼기 쉬운 경로 선택 자체도 줄어듭니다.
+- 이 방식은 특정 greenhouse geometry에 하드코딩된 예외처리가 아니라, Nav2 recovery / costmap / planner tuning 기반이라 다른 맵에도 그대로 가져가기 좋습니다.
+
+---
+
+## 남은 한계
+
+- 이번 MR은 "막히면 빨리 감지하고 후진 recovery를 우선 시도"하는 수준입니다.
+- 아직 "실제 dead-end임을 semantic하게 인식해 스스로 장거리 reverse path를 계획"하는 수준은 아닙니다.
+- 즉 아주 복잡한 협소 공간에서는 여전히
+  - Hybrid / lattice planner로의 전환
+  - 반복 stuck 지점에 대한 keep-out zone
+  - frontier goal safety margin 추가
+  같은 후속 작업이 필요할 수 있습니다.
+
+그래도 현재 요구사항인 "특정 맵 전용 예외처리보다, Nav2 기반의 일반적인 방법으로 후진 탈출을 넣고 싶다"는 목표에는 가장 낮은 리스크로 맞는 방향입니다.
+
+---
+
+## 실행
+
+기본 실행:
+
+```bash
+cd ~/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 launch agribot_navigation autonomous_mapping.launch.py use_rviz:=false
+```
+
+또는 일반 navigation:
+
+```bash
+ros2 launch agribot_navigation navigation.launch.py use_rviz:=false use_patrol:=false
+```
+
+---
+
+## 커밋
+
+- `7114209` `Improve tight-space recovery with Nav2 backout behaviors`
+
+## 변경 파일
+
+- agribot_ws/src/agribot_navigation/behavior_trees/navigate_to_pose_w_backout_recovery.xml
+- agribot_ws/src/agribot_navigation/behavior_trees/navigate_through_poses_w_backout_recovery.xml
+- agribot_ws/src/agribot_navigation/config/nav2_params.yaml
+- agribot_ws/src/agribot_navigation/config/nav2_mapping_params.yaml
+- agribot_ws/src/agribot_navigation/launch/navigation.launch.py
+- agribot_ws/src/agribot_navigation/launch/autonomous_mapping.launch.py
+- agribot_ws/src/agribot_navigation/setup.py
