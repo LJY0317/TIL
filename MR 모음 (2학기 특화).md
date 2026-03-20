@@ -2409,3 +2409,339 @@ ros2 launch agribot_navigation navigation.launch.py use_rviz:=false use_patrol:=
 - agribot_ws/src/agribot_navigation/launch/navigation.launch.py
 - agribot_ws/src/agribot_navigation/launch/autonomous_mapping.launch.py
 - agribot_ws/src/agribot_navigation/setup.py
+
+
+[자율매핑] frontier 안전 여유와 map frame 정합성 개선
+
+## 개요
+
+이번 MR의 목적은 자율 매핑 중 로봇이 좁은 틈, 포켓형 dead-end, 장애물 옆 협소 구간으로 너무 쉽게 진입하던 문제를 범용적인 방식으로 줄이는 것입니다.
+
+핵심 방향은 다음 3가지입니다.
+
+1. frontier goal을 그냥 frontier cell에 두지 않고, 안전 여유가 있는 staging cell로 보정한다.
+2. 좁은 길은 goal 생성 전에 feasibility filter로 걸러 같은 함정을 반복해서 찌르지 않게 한다.
+3. patrol/harvest의 기준 frame을 `map`으로 맞춰 정적 맵 기반 주행에서 목표점이 흔들리지 않게 한다.
+
+즉, 특정 온실 한 군데만 막는 예외처리가 아니라 frontier 선택 로직, mapping Nav2 성향, 목표 frame 기준선을 함께 정리하는 쪽으로 갔습니다.
+
+---
+
+## 배경
+
+기존 autonomous mapping은 frontier cluster를 찾은 뒤 대표점을 바로 goal로 보내는 구조였습니다.
+
+이 방식은 넓은 공간을 빨리 훑는 데는 유리하지만, 아래 문제를 남깁니다.
+
+- frontier 자체가 obstacle이나 unknown 경계 바로 옆이어도 후보가 된다.
+- 실제로 들어갈 수는 있어도 너무 비좁은 통로인지 사전에 잘 걸러내지 못한다.
+- 한 번 실패한 지점을 점 단위 blacklist만 해서, 반경이 조금만 벗어나면 다시 같은 협소 구역을 찌를 수 있다.
+- patrol waypoint는 `odom`, crop/harvest metadata는 `map`이라 정적 맵 내비게이션에서 기준 frame이 섞여 있었다.
+
+그래서 이번 작업은 "좁은 곳을 덜 위험하게 평가하는 구조" 자체를 보완하는 데 초점을 맞췄습니다.
+
+---
+
+## 주요 변경 사항
+
+### 1. frontier goal safety margin 추가
+
+- `frontier_explorer.py`에서 frontier cluster를 찾은 뒤, frontier cell 자체를 goal로 쓰지 않도록 바꿨습니다.
+- 이제는 cluster 주변에서
+  - free cell이고
+  - 지정한 안전 여유 반경 안에 unknown/occupied가 없고
+  - 실제로 로봇이 안전하게 접근 가능한
+  staging cell만 goal 후보로 남깁니다.
+- 즉 "frontier가 보인다"와 "거기로 goal을 줘도 된다"를 분리했습니다.
+
+### 2. feasibility filter 추가
+
+- frontier 후보를 뽑기 전에 path feasibility margin을 적용해, 협소 구간을 통과해야만 갈 수 있는 후보를 사전에 제외합니다.
+- 이 필터는 현재 로봇 위치에서 safe cell만 따라 도달 가능한지 기준으로 동작합니다.
+- 그래서 단순히 거리나 cluster 크기만 큰 후보보다, 실제로 무리 없이 접근 가능한 후보를 우선 남기게 됩니다.
+
+### 3. 점 blacklist를 구역 exclusion으로 확장
+
+- 실패한 frontier는 더 이상 `(x, y)` 점 하나만 막지 않습니다.
+- cluster 크기와 안전 여유를 반영한 exclusion radius를 함께 저장해, 같은 협소 구역 가장자리를 다시 조금씩 찌르는 현상을 줄였습니다.
+- 즉 retry 단위를 "점"이 아니라 "위험 구역" 쪽으로 바꿨습니다.
+
+### 4. mapping Nav2를 협소 구간에 더 보수적으로 조정
+
+- `nav2_mapping_params.yaml`에서 mapping 모드 controller/planner를 좁은 곳 기준으로 더 조심스럽게 바꿨습니다.
+- 주요 방향은 다음과 같습니다.
+- `desired_linear_vel`과 lookahead를 낮춰 좁은 구간에서 과하게 깊숙이 빨려 들어가지 않게 조정
+- `use_cost_regulated_linear_velocity_scaling=true`로 장애물 근처 감속 성향 강화
+- `use_rotate_to_heading=true`로 방향 정렬 후 진입 성향 강화
+- inflation radius 확대
+- `allow_unknown=false`로 planner가 unknown 공간을 너무 낙관적으로 가로지르지 않게 조정
+
+### 5. patrol / harvest frame 기준 통일
+
+- `patrol_waypoints.yaml`의 `frame_id`를 `odom`에서 `map`으로 변경했습니다.
+- 현재 crop catalog가 이미 `map` 기준이므로, patrol/harvest/navigation이 같은 기준선을 보도록 맞췄습니다.
+- 이 변경으로 정적 맵 기반 navigation에서 AMCL 보정이 들어와도 waypoint 자체가 움직이는 부작용을 줄일 수 있습니다.
+
+### 6. 테스트 보강
+
+- frontier 탐색 테스트에 다음 검증을 추가했습니다.
+- safety margin이 frontier cell 대신 내부 staging cell을 고르는지
+- path feasibility margin이 좁은 통로 frontier를 걸러내는지
+- reachable한 여러 후보 중 더 먼 후보를 올바르게 고르는지
+- harvest routing 테스트에는 patrol frame과 crop catalog frame이 모두 `map`인지 검증을 추가했습니다.
+
+---
+
+## 검증
+
+아래를 직접 확인했습니다.
+
+```bash
+cd ~/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+
+PYTHONPATH=/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation:$PYTHONPATH \
+pytest \
+  /home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/test/test_frontier_explorer.py \
+  /home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/test/test_harvest_routing.py
+
+python3 -m compileall \
+  /home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/agribot_navigation/frontier_explorer.py \
+  /home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/agribot_navigation/patrol_node.py \
+  /home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/agribot_navigation/harvest_route_node.py
+```
+
+결과:
+
+- `pytest` 기준 `9 passed`
+- `compileall` 통과
+
+---
+
+## 기대 효과
+
+- autonomous mapping이 좁은 포켓이나 dead-end를 이전보다 덜 낙관적으로 선택합니다.
+- goal 선정 단계에서부터 협소 구간을 더 많이 걸러, recovery에 들어가는 횟수 자체를 줄일 수 있습니다.
+- 한 번 막힌 구역을 점 단위가 아니라 반경 단위로 피해, 같은 함정을 반복 공략하는 비율이 줄어듭니다.
+- patrol, harvest, crop metadata가 모두 `map` 기준으로 맞춰져 이후 localization/harvest 동작의 기준선이 더 일관됩니다.
+
+---
+
+## 남은 한계
+
+- 이번 MR은 frontier 선택과 주행 성향을 더 안전하게 만든 것입니다.
+- 아직 "장거리 reverse planning"이나 "semantic dead-end 인식" 수준은 아닙니다.
+- 그래서 아주 복잡한 협소 환경에서는 여전히
+  - keep-out zone 자동 생성
+  - hybrid/lattice planner 전환
+  - perception 기반 공간 위험도 반영
+  같은 후속 작업이 필요할 수 있습니다.
+
+그래도 현재 단계에서는 구조를 크게 깨지 않고, 가장 범용적이고 재사용 가능한 방향으로 자율 매핑 품질을 올린 변경입니다.
+
+---
+
+## 실행
+
+```bash
+cd ~/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+ros2 launch agribot_navigation autonomous_mapping.launch.py use_rviz:=false
+```
+
+정적 맵 navigation 기준으로 patrol/harvest까지 같이 보려면:
+
+```bash
+ros2 launch agribot_navigation navigation.launch.py use_rviz:=false
+```
+
+---
+
+## 커밋
+
+- `38ff736` `frontier 탐색 안전 여유와 주행 기준 프레임을 정리한다`
+
+## 변경 파일
+
+- agribot_ws/src/agribot_navigation/agribot_navigation/frontier_explorer.py
+- agribot_ws/src/agribot_navigation/config/frontier_explorer.yaml
+- agribot_ws/src/agribot_navigation/config/nav2_mapping_params.yaml
+- agribot_ws/src/agribot_navigation/config/patrol_waypoints.yaml
+- agribot_ws/src/agribot_navigation/test/test_frontier_explorer.py
+- agribot_ws/src/agribot_navigation/test/test_harvest_routing.py
+
+---
+
+# 협소 구간 자율 매핑 안정화
+
+## 배경
+
+이번 변경은 자율 매핑 중 로봇이 막다른 통로, 식물 베드 사이의 좁은 통로, 시작점이 costmap에 부분 점유된 상황에서 같은 함정 구역을 반복 시도하다가 mapping이 사실상 멈춰 버리는 문제를 줄이기 위한 작업입니다.
+
+문제의 핵심은 두 가지였습니다.
+
+- frontier가 보이기만 하면 그 끝점 가까이에 바로 goal을 주는 구조라, 실제 주행 여유가 거의 없는 dead-end tip을 너무 자주 찔렀습니다.
+- 한 번 실패한 자리도 "점 하나 blacklist" 수준이라, 바로 옆 좌표를 다시 goal로 보내면서 같은 좁은 구간을 반복 공략했습니다.
+
+즉 지금까지는 "탐색 후보를 찾는 일"과 "실제로 로봇을 안전하게 보낼 지점을 고르는 일"이 거의 같은 것으로 취급되어 있었습니다.
+
+이번 MR은 이 둘을 분리해, 로보락 같은 로봇청소기처럼 일단 넓고 안전한 지점까지 진입한 뒤 그 자리에서 다시 frontier를 확장하는 방향으로 바꿨습니다.
+
+## 핵심 변경
+
+### 1. frontier 끝점 대신 안전한 staging cell을 고르도록 변경
+
+- `frontier_explorer.py`에서 frontier cluster를 찾는 것 자체는 유지했습니다.
+- 대신 cluster가 잡히면 그 cluster 주변 free cell을 다시 탐색해서, 실제 goal은 "조금 더 넓고 안전한 staging cell"로 선택하도록 바꿨습니다.
+- 새 점수는 아래 요소를 함께 봅니다.
+- 장애물까지의 여유 거리 `clearance`
+- 주변 free space 넓이 `support area`
+- frontier와 너무 멀어지지 않게 하는 `frontier offset penalty`
+
+쉽게 말하면, "탐색을 더 많이 열어줄 frontier"와 "로봇이 지금 당장 들어가도 덜 막히는 위치"를 동시에 고려하도록 바꾼 것입니다.
+
+### 2. goal 방향도 frontier 쪽을 보게 조정
+
+- 예전에는 goal yaw가 대체로 현재 로봇 위치 기준으로만 계산됐습니다.
+- 이제는 staging cell에 도착했을 때 로봇이 frontier 쪽을 보도록 yaw를 맞춰, 도착 직후 라이다가 미탐색 공간을 더 잘 스캔하게 했습니다.
+- 이건 좁은 포켓 앞에서 "일단 안전한 자리까지 간 다음, 그 자리에서 안쪽을 보며 맵을 넓히는" 동작에 가깝습니다.
+
+### 3. 점 blacklist를 trap region cooldown으로 확장
+
+- 실패한 goal은 이제 `(x, y)` 한 점만 막지 않습니다.
+- 일정 반경을 가진 trap region으로 잠시 blacklist하고, 일정 시간이 지나면 다시 시도할 수 있게 바꿨습니다.
+- 즉 "여긴 지금 바로 다시 찌르면 또 막힌다"를 기억하되, 영구 포기는 하지 않게 만들었습니다.
+
+이렇게 해야 한 번 막힌 dead-end를 같은 각도에서 계속 재시도하는 비율을 줄이면서도, 나중에 다른 방향에서 접근 가능해졌을 때 다시 탐색을 이어갈 수 있습니다.
+
+### 4. blacklist 때문에 후보가 다 가려진 경우 바로 종료하지 않도록 변경
+
+- 이전에는 현재 시점 후보가 비어 보이면 비교적 빨리 exploration completed로 끝날 수 있었습니다.
+- 이제는 raw frontier는 남아 있는데 현재 blacklist cooldown 때문에 잠시 제외된 상태라면, 완료로 끝내지 않고 대기 상태를 유지합니다.
+- 즉 "더 이상 frontier가 없음"과 "지금은 잠깐 재시도 보류 중"을 구분하게 했습니다.
+
+### 5. mapping Nav2를 좁은 통로 기준으로 더 보수적으로 조정
+
+- `nav2_mapping_params.yaml`에서 매핑 모드 controller와 costmap을 협소 구간 기준으로 다시 튜닝했습니다.
+- 주요 변경 방향은 다음과 같습니다.
+- `desired_linear_vel`과 lookahead를 낮춰 좁은 곳에서 너무 공격적으로 빨려 들어가지 않게 조정
+- `use_cost_regulated_linear_velocity_scaling=true`로 장애물 근처 감속 활성화
+- global costmap 해상도를 더 촘촘하게 조정해 좁은 통로를 덜 거칠게 표현
+- footprint padding과 inflation을 다시 맞춰 "너무 보수적이어서 아예 못 들어감"과 "너무 낙관적이어서 끼어듦" 사이를 재조정
+- progress checker 허용 시간을 늘려, 좁은 곳에서 천천히 비비며 빠져나오는 상황을 성급히 stalled로 오판하지 않게 조정
+
+### 6. tight-space recovery BT에 extra-long backout 단계 추가
+
+- `navigate_to_pose_w_backout_recovery.xml`
+- `navigate_through_poses_w_backout_recovery.xml`
+
+두 BT 모두 recovery retry 수를 늘리고, 기존 short/long backout 뒤에 extra-long backout 단계를 하나 더 넣었습니다.
+
+이 의미는 단순합니다.
+
+- 짧게 한 번 빼도 안 풀리면
+- 조금 더 길게 빼보고
+- 그래도 안 되면 costmap을 다시 비운 뒤 한 번 더 크게 물러나게 만든 것
+
+즉 "같은 자리에서 제자리 spin만 반복"하는 비율을 줄이고, 실제로 막다른 통로 밖으로 몸을 빼낼 여유를 더 확보하는 쪽입니다.
+
+## 왜 이 방향이 로봇청소기와 비슷한가
+
+로봇청소기는 보통 막힌 지점을 보자마자 같은 끝점으로 계속 돌진하지 않습니다.
+
+- 먼저 현재 각도에서 무리한지 판단하고
+- 잠깐 미루거나
+- 조금 넓은 자리로 빠져나온 뒤
+- 다른 각도에서 다시 들어갑니다.
+
+이번 변경도 정확히 그 철학을 가져왔습니다.
+
+- frontier를 봤다고 바로 끝점으로 가지 않음
+- 실패 구역을 잠시 deferred 상태로 둠
+- 회복 후 다른 후보를 먼저 돌림
+- 나중에 cooldown이 지나면 다시 시도함
+
+즉 "한 번 막히면 끝"보다 "지금은 미루고 다른 데를 더 그린 뒤 다시 오기"에 더 가깝게 바꿨습니다.
+
+## 검증
+
+아래를 직접 확인했습니다.
+
+```bash
+cd /home/ssafy/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+
+PYTHONPATH=/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation:$PYTHONPATH \
+python3 -m pytest \
+  /home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/test/test_frontier_explorer.py
+
+python3 -m py_compile \
+  /home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/agribot_navigation/frontier_explorer.py
+
+unset AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-up-to agribot_navigation --symlink-install
+```
+
+결과:
+
+- `pytest` 기준 `5 passed`
+- `py_compile` 통과
+- `colcon build --packages-up-to agribot_navigation --symlink-install` 통과
+
+## 실행 방법
+
+이번 변경으로 launch 명령 자체는 바뀌지 않았습니다.
+
+```bash
+cd ~/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export DRI_PRIME=1
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+
+ros2 launch agribot_navigation autonomous_mapping.launch.py
+```
+
+GUI 없이 빠르게 확인하려면:
+
+```bash
+ros2 launch agribot_navigation autonomous_mapping.launch.py use_rviz:=false
+```
+
+## 기대 효과
+
+- 협소 구간 끝점으로 바로 돌진하는 비율이 줄어듭니다.
+- 한 번 실패한 포켓을 같은 위치에서 곧바로 반복 시도하는 비율이 줄어듭니다.
+- 좁은 통로에서는 더 천천히, 더 촘촘한 costmap 기준으로 움직여 주행 자체가 덜 공격적이 됩니다.
+- recovery가 실제로 통로 밖으로 빠져나오도록 한 단계 더 깊어져, 매핑 중단 없이 다음 후보로 넘어갈 확률이 높아집니다.
+
+## 한계와 다음 후보
+
+- 이번 변경은 "좁은 구간에서 덜 막히도록 만드는 범용 안정화"입니다.
+- 완전한 의미의 로보락급 커버리지 완주는 아직 보장할 수 없습니다.
+- 앞으로 더 가려면 아래가 후보입니다.
+- trap region을 단순 시간 기반이 아니라 실패 횟수 기반으로 더 지능적으로 누적하기
+- local costmap과 frontier score에 semantic obstacle 위험도 반영하기
+- dead-end 패턴을 별도 탐지해 reverse escape 전략을 분기하기
+- 시뮬레이션 장시간 런에서 실제 완료율을 계측하는 회귀 테스트 만들기
+
+그래도 현재 단계에서는 코드 구조를 크게 깨지 않으면서, 협소 구간에서 가장 재사용 가치가 큰 안정화 축을 넣은 변경입니다.
+
+## 커밋
+
+- 프로젝트 저장소 커밋: `2c8c906`
+- 메시지: `협소 구간 자율 매핑의 함정 회피와 복구 안정성을 강화한다`
+
+## 변경 파일
+
+- agribot_ws/src/agribot_navigation/agribot_navigation/frontier_explorer.py
+- agribot_ws/src/agribot_navigation/config/frontier_explorer.yaml
+- agribot_ws/src/agribot_navigation/config/nav2_mapping_params.yaml
+- agribot_ws/src/agribot_navigation/behavior_trees/navigate_to_pose_w_backout_recovery.xml
+- agribot_ws/src/agribot_navigation/behavior_trees/navigate_through_poses_w_backout_recovery.xml
+- agribot_ws/src/agribot_navigation/test/test_frontier_explorer.py
+- docs/현 프로젝트 진행 상황.md
