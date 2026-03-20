@@ -2745,3 +2745,120 @@ ros2 launch agribot_navigation autonomous_mapping.launch.py use_rviz:=false
 - agribot_ws/src/agribot_navigation/behavior_trees/navigate_through_poses_w_backout_recovery.xml
 - agribot_ws/src/agribot_navigation/test/test_frontier_explorer.py
 - docs/현 프로젝트 진행 상황.md
+
+---
+
+# 시작 위치 bootstrap / stall 탈출 후속 보강
+
+## 왜 이 보강이 필요했는가
+
+이전 안정화 이후에도 "로봇이 시작 위치에서 아예 안 움직이는" 경우가 남아 있었습니다.
+
+이 현상은 단순히 바퀴가 안 도는 문제가 아니라, 시작 직후 `frontier 후보를 충분히 못 만들었거나`, 만들어도 `첫 goal을 주기에 아직 맵이 덜 열린 상태`라서 다음 목적지 선택이 너무 이르게 실패하는 패턴에 가깝습니다.
+
+쉽게 말하면:
+
+- 로봇은 아직 주변을 충분히 못 봤는데
+- explorer는 바로 "갈 곳이 없다"거나 "지금 frontier는 애매하다"고 판단하고
+- 그래서 첫 주행이 열리기 전에 멈춰 버리던 것입니다.
+
+로보락 같은 로봇청소기는 보통 이런 상황에서 바로 포기하지 않습니다.
+
+- 먼저 제자리에서 한 바퀴 돌며 주변을 더 보고
+- 그래도 애매하면 조금 빠져나왔다가
+- 다시 주변을 보고 다음 경로를 고릅니다.
+
+이번 후속 보강은 바로 그 시작 동작을 넣은 것입니다.
+
+## 이번에 추가한 내용
+
+### 1. 초기 startup bootstrap 추가
+
+- frontier explorer에 `startup bootstrap` 단계를 추가했습니다.
+- 시작 직후 유효한 frontier 후보가 부족하면, 바로 완료/정지를 하지 않고 먼저 `360도 spin`을 수행합니다.
+- 첫 spin 뒤에도 여전히 시작 위치에서 탐색이 안 열리면, `후진 -> 다시 360도 spin` 순서로 한 번 더 탈출을 시도합니다.
+
+즉 시작 위치가 넓은 공간이든, 약간 끼어 있는 위치든, "아무 것도 못 하고 정지"하기보다 최소한 주변을 더 보고 빠져나올 기회를 한 번 더 갖게 했습니다.
+
+### 2. startup 단계 전용 완화 기준 추가
+
+- 시작 단계에서는 일반 주행 때보다 완화된 기준을 씁니다.
+- `minimum_frontier_cluster_size`
+- `minimum_goal_distance_m`
+
+이 두 값을 startup 전용 값으로 따로 둬서, 맵이 아직 작은 패치만 열렸을 때도 첫 goal이 너무 엄격한 필터에 걸려 사라지지 않게 했습니다.
+
+핵심은 "처음 한 발 떼기"를 더 쉽게 만드는 것입니다.
+
+### 3. stalled / occupied 이후 명시적 escape sequence 추가
+
+- 주행 중 좁은 포켓이나 dead-end에서 `stalled`, `occupied`, 비슷한 failure가 나면 이제 바로 다음 frontier만 다시 고르지 않습니다.
+- 먼저 `제자리 회전 -> 후진` escape sequence를 한 번 수행한 뒤에 재탐색합니다.
+
+이 의미는 단순합니다.
+
+- 지금 자세로는 계속 비슷한 실패가 날 가능성이 높으니
+- 일단 각도를 바꾸고
+- 몸을 조금 뒤로 빼고
+- 그 다음 다시 후보를 고르자는 것입니다.
+
+즉 recovery를 BT 내부 backout에만 맡기지 않고, explorer 레벨에서도 "탈출 후 재탐색" 의도를 명확히 넣었습니다.
+
+## 기대 효과
+
+- 시작 위치에서 frontier가 바로 안 잡혀도 즉시 멈추지 않고, 스스로 주변을 더 스캔한 뒤 첫 goal을 다시 찾게 됩니다.
+- 시작 위치가 약간 막힌 곳이어도 후진 후 재스캔으로 첫 주행이 열릴 가능성이 올라갑니다.
+- 좁은 곳에서 stalled가 난 뒤에도 같은 각도에서 바로 다음 goal을 찌르는 비율이 줄어듭니다.
+- 결과적으로 "시작부터 멈춤"과 "협소 구간에서 멈춤" 두 패턴을 같은 철학으로 줄이게 됩니다.
+
+## 검증
+
+아래를 다시 확인했습니다.
+
+```bash
+cd /home/ssafy/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+
+PYTHONPATH=/home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation:$PYTHONPATH \
+python3 -m pytest \
+  /home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/test/test_frontier_explorer.py
+
+python3 -m py_compile \
+  /home/ssafy/SSAFY/S14P21A602/agribot_ws/src/agribot_navigation/agribot_navigation/frontier_explorer.py
+
+unset AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-up-to agribot_navigation --symlink-install
+```
+
+결과:
+
+- `pytest` 기준 `5 passed`
+- `py_compile` 통과
+- `colcon build --packages-up-to agribot_navigation --symlink-install` 통과
+
+## 실행 방법
+
+이번 후속 보강으로도 실행 명령 자체는 바뀌지 않았습니다.
+
+```bash
+cd ~/SSAFY/S14P21A602/agribot_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export DRI_PRIME=1
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+
+ros2 launch agribot_navigation autonomous_mapping.launch.py
+```
+
+## 커밋
+
+- 프로젝트 저장소 커밋: `c48cd95`
+- 메시지: `시작 위치 bootstrap과 stall 탈출 시퀀스를 추가한다`
+
+## 변경 파일
+
+- agribot_ws/src/agribot_navigation/agribot_navigation/frontier_explorer.py
+- agribot_ws/src/agribot_navigation/config/frontier_explorer.yaml
+- docs/현 프로젝트 진행 상황.md
